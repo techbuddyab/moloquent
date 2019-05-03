@@ -1,5 +1,5 @@
 {
-  "name": "moloquent/moloquent",
+  "name": "techbuddyab/moloquent",
   "description": "A MongoDB based Eloquent model and Query builder for Laravel (Moloquent)",
   "keywords": [
     "laravel",
@@ -10,7 +10,7 @@
     "model",
     "moloquent"
   ],
-  "homepage": "https://github.com/moloquent/moloquent",
+  "homepage": "https://github.com/techbuddyab/moloquent",
   "authors": [
     {
       "name": "Moloquent",

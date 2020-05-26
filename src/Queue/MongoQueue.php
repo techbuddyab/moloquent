@@ -3,19 +3,43 @@
 namespace Moloquent\Queue;
 
 use Carbon\Carbon;
+use Exception;
+use Illuminate\Database\Connection;
 use Illuminate\Queue\DatabaseQueue;
 use Illuminate\Queue\Jobs\DatabaseJob;
-use MongoDB\Operation\FindOneAndUpdate;
+use MongoDB;
+use MongoDB\Driver;
+use Log;
 
 class MongoQueue extends DatabaseQueue
 {
+    /** @var MongoDB\Client */
+    private $client;
+
+    private $databaseName;
+
     /**
-     * The expiration time of a job.
-     *
-     * @var int|null
+     * @param \Illuminate\Database\Connection $database
+     * @param string $table
+     * @param string $default
+     * @param int $expire
      */
-    protected $expire = 60;
-    
+    public function __construct(Connection $database, $table, $default = 'default', $expire = 60)
+    {
+        parent::__construct($database, $table, $default, $expire);
+        $dsn = $database->getConfig('dsn');
+
+        $options = [
+            "journal" => true,
+            "w" => MongoDB\Driver\WriteConcern::MAJORITY
+        ];
+
+        $driverOptions = [];
+
+        $this->client = new MongoDB\Client($dsn, $options, $driverOptions);
+        $this->databaseName = $database->getConfig('database');
+    }
+
     /**
      * Pop the next job off of the queue.
      *
@@ -26,107 +50,13 @@ class MongoQueue extends DatabaseQueue
     public function pop($queue = null)
     {
         $queue = $this->getQueue($queue);
-        
-        if (!is_null($this->expire)) {
-            $this->releaseJobsThatHaveBeenReservedTooLong($queue);
-        }
-        
-        if ($job = $this->getNextAvailableJobAndReserve($queue)) {
-            return new MongoJob(
+
+        // Atomic operation to find and update the job in the same instant
+        if ($job = $this->getNextAvailableJobAndMarkAsReserved($queue)) {
+            return new DatabaseJob(
                 $this->container, $this, $job, $this->connectionName, $queue
             );
         }
-    }
-
-    /**
-     * Get the next available job for the queue and mark it as reserved.
-     *
-     * When using multiple daemon queue listeners to process jobs there
-     * is a possibility that multiple processes can end up reading the
-     * same record before one has flagged it as reserved.
-     *
-     * This race condition can result in random jobs being run more then
-     * once. To solve this we use findOneAndUpdate to lock the next jobs
-     * record while flagging it as reserved at the same time.
-     *
-     * @param string|null $queue
-     *
-     * @return \StdClass|null
-     */
-    protected function getNextAvailableJobAndReserve($queue)
-    {
-        $job = $this->database->getCollection($this->table)->findOneAndUpdate(
-            [
-                'queue'        => $this->getQueue($queue),
-                'reserved'     => 0,
-                'available_at' => ['$lte' => $this->currentTime()],
-
-            ],
-            [
-                '$set' => [
-                    'reserved'    => 1,
-                    'reserved_at' => $this->currentTime(),
-                ],
-            ],
-            [
-                'returnDocument' => FindOneAndUpdate::RETURN_DOCUMENT_AFTER,
-                'sort'           => ['available_at' => 1],
-            ]
-        );
-
-        if ($job) {
-            $job->id = $job->_id;
-        }
-
-        return $job;
-    }
-
-    /**
-     * Release the jobs that have been reserved for too long.
-     *
-     * @param string $queue
-     *
-     * @return void
-     */
-    protected function releaseJobsThatHaveBeenReservedTooLong($queue)
-    {
-        $expiration = Carbon::now()->subSeconds($this->expire)->getTimestamp();
-        $now = time();
-
-        $reserved = $this->database->collection($this->table)
-            ->where('queue', $this->getQueue($queue))
-            ->where(function ($query) use ($expiration, $now) {
-                // Check for available jobs
-                $query->where(function ($query) use ($now) {
-                    $query->whereNull('reserved_at');
-                    $query->where('available_at', '<=', $now);
-                });
-
-                // Check for jobs that are reserved but have expired
-                $query->orWhere('reserved_at', '<=', $expiration);
-            })->get();
-
-        foreach ($reserved as $job) {
-            $attempts = $job['attempts'] + 1;
-            $this->releaseJob($job['_id'], $attempts);
-        }
-    }
-
-    /**
-     * Release the given job ID from reservation.
-     *
-     * @param string $id
-     * @param int    $attempts
-     *
-     * @return void
-     */
-    protected function releaseJob($id, $attempts)
-    {
-        $this->database->table($this->table)->where('_id', $id)->update([
-            'reserved'    => 0,
-            'reserved_at' => null,
-            'attempts'    => $attempts,
-        ]);
     }
 
     /**
@@ -139,6 +69,118 @@ class MongoQueue extends DatabaseQueue
      */
     public function deleteReserved($queue, $id)
     {
-        $this->database->collection($this->table)->where('_id', $id)->delete();
+        try {
+            $this->client->selectCollection($this->databaseName, $this->table)->deleteOne(
+                ['_id' => $id],
+                ['$isolated' => 1]
+            );
+        } catch (Exception $e) {
+            Log::error('Error while selecting mongo collection: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     *
+     * @param $queue
+     */
+    protected function getNextAvailableJobAndMarkAsReserved($queue)
+    {
+        $expiration = Carbon::now()->subSeconds($this->retryAfter)->getTimestamp();
+
+        $job = $this->client->selectCollection($this->databaseName, $this->table)->findOneAndUpdate(
+            [
+                'queue' => $this->getQueue($queue),
+                '$or' => [
+                    [
+                        'reserved_at' => null,
+                        'available_at' => ['$lte' => $this->currentTime()]
+                    ],
+                    [
+                        'reserved_at' => ['$lte' => $expiration]
+                    ]
+                ]
+            ],
+            [
+                '$set' => ['reserved_at' => $this->currentTime()],
+                '$inc' => ['attempts' => 1]
+            ],
+            [
+                'sort' => ['_id' => 1],
+                'returnDocument' => MongoDB\Operation\FindOneAndUpdate::RETURN_DOCUMENT_AFTER,
+                '$isolated' => 1
+            ]
+        );
+
+        if ($job) {
+            $this->database->commit();
+            $job = (object)$job;
+            $job->id = $job->_id;
+        }
+
+        return $job ?: null;
+    }
+
+    /**
+     * Get the next available job for the queue.
+     *
+     * @param string|null $queue
+     *
+     * @return \StdClass|null
+     */
+    protected function getNextAvailableJob($queue)
+    {
+        $expiration = Carbon::now()->subSeconds($this->retryAfter)->getTimestamp();
+
+        $job = $this->client->selectCollection($this->databaseName, $this->table)->findOne(
+            [
+                'queue' => $this->getQueue($queue),
+                '$or' => [
+                    [
+                        'reserved_at' => null,
+                        'available_at' => ['$lte' => $this->currentTime()]
+                    ],
+                    [
+                        'reserved_at' => ['$lte' => $expiration]
+                    ]
+                ]
+            ],
+            ['sort' => ['_id' => 1]]);
+
+        if ($job) {
+            $job = (object)$job;
+            $job->id = $job->_id;
+        }
+
+        return $job ?: null;
+    }
+
+    /**
+     * Mark the given job ID as reserved.
+     *
+     * @param \stdClass $job
+     *
+     * @return \stdClass
+     */
+    protected function markJobAsReserved($job)
+    {
+        $job->attempts = $job->attempts + 1;
+        $job->reserved_at = $this->currentTime();
+
+        try {
+            $this->client->selectCollection($this->databaseName, $this->table)->updateOne(
+                ['_id' => $job->id],
+                [
+                    '$set' => [
+                        'reserved_at' => $job->reserved_at,
+                        'attempts' => $job->attempts
+                    ]
+                ],
+                ['$isolated' => 1]
+            );
+
+            $this->database->commit();
+        } catch (Exception $e) {
+            Log::error('Error while marking job as reserved: ' . $e->getMessage());
+        }
     }
 }
